@@ -1,6 +1,6 @@
-# bdg3min_final_bot.py
-# Final BDG 3-min Telegram bot (API-based)
-# Flow: Prediction (text) -> Result (GIF only) -> Next Prediction (text)
+# bdg3min_final_bot_v5.py
+# BDG 3-min Telegram bot — V5 Market-Mode + 10-result learning phase
+# Merged & upgraded from your uploaded bdg3min_final_bot.py
 # Requirements: pip install pyTelegramBotAPI requests
 
 import time
@@ -10,24 +10,34 @@ import sqlite3
 import datetime
 import requests
 import telebot
+import statistics
+import collections
 
 # ---------------- CONFIG - EDIT THESE ----------------
-BOT_TOKEN = "8595314247:AAG_WqyrlWX0VxRljU2zLnVwJo1DR-uZCgs"   # e.g. "123456:ABC..."
+BOT_TOKEN = "8595314247:AAG_WqyrlWX0VxRljU2zLnVwJo1DR-uZCgs"   # your bot token
 OWNER_ID = 5698239751                         # your numeric Telegram ID
 BDG_HISTORY_API = "https://draw.ar-lottery01.com/WinGo/WinGo_3M/GetHistoryIssuePage.json"
-MARTINGALE = [10, 30, 70, 210, 640, 1400]
 PAGE_SIZE = 12               # how many past results to request
 RESULT_STABLE_WAIT = 5       # seconds to wait after tick before reading API
-DB_FILE = "bdg3min_final_bot.db"
+DB_FILE = "bdg3min_final_bot_v5.db"
 REQUEST_TIMEOUT = 8
 # GIF direct URLs (wins/losses)
 WIN_GIF = "https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExM2JheDIydTA3ZmdmZDc2aGRzeHdieDZpb2V3dmJ0cGxkZzkzOWl5aSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/OR1aQzSbvf4DrgX22C/giphy.gif"
 LOSS_GIF = "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExd2t2MjFhamxrMnRnMTE2bGZubmduNW9zMXVpZGNyaGxybzR4dHVyciZlcD12MV9naWZzX3NlYXJjaCZjdD1n/a7BCmY3LaiFilsvR32/giphy.gif"
 
+# ---------------- Level/Amount Rules ----------------
+# Levels 1..5 specific amounts; level >=6 amount fixed at 1470
+LEVEL_AMOUNTS = {1:10, 2:30, 3:70, 4:210, 5:490}
+FIXED_AMOUNT_AFTER_6 = 1470
+
+# How many real results to collect before AI activates
+LEARNING_RESULTS_N = 10
+MAX_MEMORY = 80
+
 # ----------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
-logger = logging.getLogger("bdg3min_final")
+logger = logging.getLogger("bdg3min_final_v5")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -69,19 +79,32 @@ def get_meta(k, default=None):
     r = db_exec("SELECT v FROM meta WHERE k=?", (k,), fetch=True)
     return r[0][0] if r else default
 
+# ---------- utility ----------
+def amount_for_level(lvl: int) -> int:
+    if lvl <= 0:
+        return LEVEL_AMOUNTS[1]
+    if lvl <= 5:
+        return LEVEL_AMOUNTS.get(lvl, LEVEL_AMOUNTS[5])
+    return FIXED_AMOUNT_AFTER_6
+
 # ---------- state ----------
 state = {
     "running": False,
     "channels": set(get_meta("channels", "") .split(",")) if get_meta("channels") else set(),
     "level": int(get_meta("level", "1") or 1),
-    "amount": int(get_meta("amount", str(MARTINGALE[0])) or MARTINGALE[0]),
-    "last_period": get_meta("last_period", None)
+    "amount": int(get_meta("amount", str(LEVEL_AMOUNTS[1])) or LEVEL_AMOUNTS[1]),
+    "last_period": get_meta("last_period", None),
+    "learning": get_meta("learning", "1") == "1",   # learning mode enabled by default
+    "collected": int(get_meta("collected", "0") or 0),
 }
+
+previous_results = collections.deque(maxlen=MAX_MEMORY)  # store recent actuals as "BIG"/"SMALL"
+
 @bot.message_handler(commands=['testgif'])
 def cmd_testgif(message):
     try:
-        bot.send_animation(message.chat.id, "https://media.tenor.com/0jndurai1S0AAAAC/baby-yes.gif")
-        bot.send_animation(message.chat.id, "https://media.tenor.com/o3GgW0lPx2oAAAAC/disappointed.gif")
+        bot.send_animation(message.chat.id, WIN_GIF)
+        bot.send_animation(message.chat.id, LOSS_GIF)
         bot.send_message(message.chat.id, "GIF test completed.")
     except Exception as e:
         bot.send_message(message.chat.id, f"GIF FAILED: {e}")
@@ -91,6 +114,8 @@ def persist_state():
     set_meta("level", state["level"])
     set_meta("amount", state["amount"])
     set_meta("last_period", state["last_period"])
+    set_meta("learning", "1" if state.get("learning") else "0")
+    set_meta("collected", state.get("collected", 0))
 
 # ---------- API fetch ----------
 def fetch_history_from_api(page_no=1):
@@ -147,34 +172,133 @@ def next_3min_tick(now=None):
         target = target + datetime.timedelta(minutes=3)
     return target
 
-# ---------- core loop ----------
-def prediction_loop():
-    logger.info("prediction loop started (API-based)")
+# ---------- MARKET MODE LOGIC (V5) ----------
 
-    # initial read to know last_period
+def detect_mode(recent):
+    """
+    recent: list of last N results where each item is 'BIG' or 'SMALL'
+    Returns: mode string among ['TRAP','TREND','RANGING','BREAKOUT','UNKNOWN']
+    """
+    if not recent:
+        return "UNKNOWN"
+    n = len(recent)
+    # counts
+    cnt_big = recent.count("BIG")
+    cnt_small = recent.count("SMALL")
+
+    # Trap detection: specific patterns that indicate fakeouts
+    pattern_str = ",".join(recent[-8:])
+    traps = [
+        "BIG,BIG,BIG,SMALL,BIG,SMALL",
+        "SMALL,SMALL,SMALL,BIG,SMALL,BIG",
+    ]
+    for t in traps:
+        if t in pattern_str:
+            return "TRAP"
+
+    # Strong trend: 5 or more same in last 8
+    last8 = recent[-8:]
+    if len(last8) >= 5:
+        if last8.count("BIG") >= 5:
+            return "TREND_BIG"
+        if last8.count("SMALL") >= 5:
+            return "TREND_SMALL"
+
+    # Ranging / zig-zag detection: alternating pattern in last 6
+    last6 = recent[-6:]
+    if len(last6) >= 4:
+        # check alternating
+        alt = True
+        for i in range(1, len(last6)):
+            if last6[i] == last6[i-1]:
+                alt = False
+                break
+        if alt:
+            return "RANGING"
+
+    # Breakout: sudden change after trend: last 4 has 3 of one then different
+    if len(last8) >= 5:
+        if last8[-5:-1].count(last8[-5]) >= 3 and last8[-1] != last8[-2]:
+            return "BREAKOUT"
+
+    return "UNKNOWN"
+
+
+def decide_prediction(recent):
+    """
+    Uses Market Mode priority: TRAP > TREND > RANGING > BREAKOUT > UNKNOWN
+    Returns 'BIG' or 'SMALL'
+    """
+    mode = detect_mode(recent)
+    logger.debug("Market mode detected: %s", mode)
+
+    if mode == "TRAP":
+        # conservative: predict opposite of immediate-looking trend or last
+        if not recent:
+            return random_choice()
+        # reverse of last to avoid trap
+        return "SMALL" if recent[-1] == "BIG" else "BIG"
+
+    if mode == "TREND_BIG":
+        return "BIG"
+    if mode == "TREND_SMALL":
+        return "SMALL"
+
+    if mode == "RANGING":
+        # anti-trend: reverse last
+        return "SMALL" if recent[-1] == "BIG" else "BIG"
+
+    if mode == "BREAKOUT":
+        # continuation of last
+        return recent[-1]
+
+    # UNKNOWN -> use weighted recent scoring
+    # weight recent more: last 6 with linear weights
+    weights = [1,1,2,2,3,4]
+    seq = recent[-6:]
+    if not seq:
+        return random_choice()
+    # pad weights and seq if necessary
+    w = weights[-len(seq):]
+    score = 0
+    for i, val in enumerate(seq):
+        weight = w[i]
+        if val == "BIG":
+            score += weight
+        else:
+            score -= weight
+    return "BIG" if score > 0 else "SMALL"
+
+
+def random_choice():
+    import random
+    return random.choice(["BIG","SMALL"])
+
+# ---------- core loop ----------
+
+def prediction_loop():
+    logger.info("prediction loop started (API-based V5)")
+
+    # initial read to know last_period and to prefill recent results buffer if available
     rows = fetch_history_from_api()
     if rows and len(rows) > 0:
         state["last_period"] = rows[0].get("issueNumber")
+        # fill previous_results with recent history (most recent first)
+        for r in rows[::-1]:
+            num = r.get("number")
+            try:
+                bs = "BIG" if int(num) > 4 else "SMALL"
+            except:
+                bs = "SMALL"
+            previous_results.append(bs)
         persist_state()
-        logger.info("initial last_period set to %s", state["last_period"])
-        # prepare and send first prediction immediately based on last_period
-        try:
-            next_period = str(int(state["last_period"]) + 1)
-        except Exception:
-            next_period = state["last_period"] + "1"
-        # prediction by parity of next_period
-        try:
-            pred_val = "SMALL" if (int(next_period) % 2 == 0) else "BIG"
-        except:
-            pred_val = "SMALL"
-        # send prediction text to owner + channels
-        pred_msg = f"🔮 Prediction\nPeriod: {next_period}\n➡️ {pred_val}\nAmount: {state['amount']} | Level: {state['level']}"
-        send_to_owner_and_channels_send_text(pred_msg)
-        # record pending prediction
-        db_exec("INSERT INTO history(period,predicted,amount,level,actual,win) VALUES (?,?,?,?,?,?)",
-                (next_period, pred_val, state["amount"], state["level"], None, None))
+        logger.info("initial last_period set to %s, primed %d results", state["last_period"], len(previous_results))
     else:
         logger.info("no initial rows found; will sync to tick")
+
+    # if learning enabled and not yet collected enough, inform owner
+    if state.get("learning"):
+        send_to_owner_and_channels_send_text(f"⚠️ Learning mode ON: I will collect {LEARNING_RESULTS_N} real results first (~{LEARNING_RESULTS_N*3} minutes) before activating AI predictions.")
 
     while state["running"]:
         try:
@@ -223,6 +347,8 @@ def prediction_loop():
             # if first-time initialization
             if not state["last_period"]:
                 state["last_period"] = actual_period
+                previous_results.append(actual_bs)
+                state["collected"] = min(LEARNING_RESULTS_N, state.get("collected", 0) + 1)
                 persist_state()
                 logger.info("initialized last_period to %s", state["last_period"])
                 continue
@@ -231,6 +357,10 @@ def prediction_loop():
             if actual_period == state["last_period"]:
                 logger.info("same period as last (%s) — nothing new", actual_period)
                 continue
+
+            # add actual to memory
+            previous_results.append(actual_bs)
+            state["collected"] = min(LEARNING_RESULTS_N, state.get("collected", 0) + 1) if state.get("learning") else state.get("collected", 0)
 
             # Resolve pending prediction (if exists)
             pending_rows = db_exec("SELECT id, period, predicted, amount, level FROM history WHERE win IS NULL ORDER BY id DESC LIMIT 1", fetch=True)
@@ -244,21 +374,30 @@ def prediction_loop():
                 gif = WIN_GIF if win_flag == 1 else LOSS_GIF
                 send_to_owner_and_channels_send_gif(gif)
 
-                # Update martingale
+                # Update martingale / levels according to your rule:
                 if win_flag == 1:
                     state["level"] = 1
-                    state["amount"] = MARTINGALE[0]
+                    state["amount"] = amount_for_level(1)
                 else:
-                    if state["level"] < len(MARTINGALE):
-                        state["level"] += 1
-                        state["amount"] = MARTINGALE[state["level"] - 1]
-                    else:
-                        state["amount"] = MARTINGALE[-1]
+                    # increment level by 1 (no cap) but amount fixed at FIXED_AMOUNT_AFTER_6 for level>=6
+                    state["level"] = state.get("level",1) + 1
+                    state["amount"] = amount_for_level(state["level"])
                 persist_state()
 
             # update last_period
             state["last_period"] = actual_period
             persist_state()
+
+            # If learning mode and not yet collected enough results, do not send next prediction
+            if state.get("learning") and state.get("collected",0) < LEARNING_RESULTS_N:
+                logger.info("Learning phase: collected %d/%d results. Waiting...", state.get("collected",0), LEARNING_RESULTS_N)
+                continue
+
+            # If learning mode finished now, announce and set learning=False
+            if state.get("learning") and state.get("collected",0) >= LEARNING_RESULTS_N:
+                state["learning"] = False
+                persist_state()
+                send_to_owner_and_channels_send_text(f"✅ Learning complete ({LEARNING_RESULTS_N} results). AI predictions activated.")
 
             # prepare next prediction (period + 1)
             try:
@@ -266,12 +405,10 @@ def prediction_loop():
             except:
                 next_period = actual_period + "1"
 
-            try:
-                pred_val = "SMALL" if (int(next_period) % 2 == 0) else "BIG"
-            except:
-                pred_val = "SMALL"
+            # Decide prediction using market-mode logic based on previous_results
+            pred_val = decide_prediction(list(previous_results))
 
-            # Immediately send next prediction (text)
+            # send prediction text to owner + channels
             pred_msg = f"🔮 Prediction\nPeriod: {next_period}\n➡️ {pred_val}\nAmount: {state['amount']} | Level: {state['level']}"
             send_to_owner_and_channels_send_text(pred_msg)
 
@@ -302,7 +439,7 @@ def owner_only(func):
 # ---------- Telegram commands ----------
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
-    bot.reply_to(message, "BDG 3min bot online. Owner commands: /startbot /stopbot /addchannel /removechannel /stats /history")
+    bot.reply_to(message, "BDG 3min bot online. Owner commands: /startbot /stopbot /addchannel /removechannel /stats /history /mode")
 
 @bot.message_handler(commands=['startbot'])
 @owner_only
@@ -311,8 +448,11 @@ def cmd_startbot(message):
         bot.reply_to(message, "⚠️ Bot already running.")
         return
     state["running"] = True
+    # reset learning counters so we collect fresh results
+    state["learning"] = True
+    state["collected"] = 0
     persist_state()
-    bot.reply_to(message, "✅ Bot started. Will send prediction, then GIF result, then next prediction.")
+    bot.reply_to(message, "✅ Bot started. Learning mode ON — collecting real results for 10 rounds (~30 minutes). I will notify when AI activates.")
     threading.Thread(target=prediction_loop, daemon=True).start()
 
 @bot.message_handler(commands=['stopbot'])
@@ -355,7 +495,7 @@ def cmd_stats(message):
     wins = db_exec("SELECT COUNT(*) FROM history WHERE win=1", fetch=True)[0][0]
     losses = db_exec("SELECT COUNT(*) FROM history WHERE win=0", fetch=True)[0][0]
     pending = db_exec("SELECT COUNT(*) FROM history WHERE win IS NULL", fetch=True)[0][0]
-    bot.reply_to(message, f"📊 Stats:\nWins: {wins}\nLosses: {losses}\nPending: {pending}\nLevel: {state['level']} Amount: {state['amount']}")
+    bot.reply_to(message, f"📊 Stats:\nWins: {wins}\nLosses: {losses}\nPending: {pending}\nLevel: {state['level']} Amount: {state['amount']} Learning: {state.get('learning')} Collected: {state.get('collected')}")
 
 @bot.message_handler(commands=['history'])
 @owner_only
@@ -365,6 +505,13 @@ def cmd_history(message):
     for r in rows:
         text += f"{r}\n"
     bot.reply_to(message, text)
+
+@bot.message_handler(commands=['mode'])
+@owner_only
+def cmd_mode(message):
+    # quick dump of the detected mode using current memory
+    mode = detect_mode(list(previous_results))
+    bot.reply_to(message, f"Current detected mode: {mode} (memory size: {len(previous_results)})")
 
 # ---------- start polling ----------
 if __name__ == "__main__":
@@ -376,7 +523,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     persist_state()
-    logger.info("Starting bot. Owner id=%s", OWNER_ID)
+    logger.info("Starting bot V5. Owner id=%s", OWNER_ID)
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
     except KeyboardInterrupt:
