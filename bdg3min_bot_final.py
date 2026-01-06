@@ -22,8 +22,8 @@ DB_FILE = "bdg3min_final_bot_v5.db"
 REQUEST_TIMEOUT = 8
 
 # GIFs (win / loss)
-WIN_GIF = "https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExM2JheDIydTA3ZmdmZDc2aGRzeHdieDZpb2V3dmJ0cGxkZzkzOWl5aSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/OR1aQzSbvf4DrgX22C/giphy.gif"
-LOSS_GIF = "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExd2t2MjFhamxrMnRnMTE2bGZubmduNW9zMXVpZGNyaGxybzR4dHVyciZlcD12MV9naWZzX3NlYXJjaCZjdD1n/a7BCmY3LaiFilsvR32/giphy.gif"
+WIN_GIF = "https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExdWQwaWl1cWJoZzR6MHR2cGx2dWdvOGFkNnlxYWs3dTUwZ21iNHJpbyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/CFaGnXWf6GABHKKZcC/giphy.gif"
+LOSS_GIF = "https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExNzY4NXI5eWlrbWhmcnlrbXhnajZ0amZhZnJkbnJycnM3dHk5NWF5cSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/3otPoU74ilAX3nyRPi/giphy.gif"
 
 # martingale levels (amounts)
 LEVEL_AMOUNTS = {1: 10, 2: 30, 3: 70, 4: 210, 5: 490}
@@ -542,3 +542,4 @@ if __name__ == "__main__":
         logger.info("Keyboard interrupt, exiting.")
     except Exception:
         logger.exception("Bot polling stopped unexpectedly.")
+
